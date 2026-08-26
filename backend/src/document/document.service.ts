@@ -13,15 +13,13 @@ import { CreateDocumentDto } from './dto/create-document.dto';
 import { UpdateDocumentDto } from './dto/update-document.dto';
 import { QueryDocumentDto } from './dto/query-document.dto';
 import { UploadParseDto } from './dto/upload-parse.dto';
-import {
-  DocumentEntity,
-  DocumentStatus,
-} from './entities/document.entity';
+import { DocumentEntity, DocumentStatus } from './entities/document.entity';
 import {
   DocumentContent,
   DocumentContentDocument,
 } from './schemas/document-content.schema';
 import { RustfsService } from '../storage/rustfs.service';
+import { DocumentPipelinePublisher } from '../mq/document-pipeline.publisher';
 import { FileParserService } from './parser/file-parser.service';
 import {
   decodeUploadFilename,
@@ -48,6 +46,7 @@ export class DocumentService {
     private readonly contentModel: Model<DocumentContentDocument>,
     private readonly fileParserService: FileParserService,
     private readonly rustfs: RustfsService,
+    private readonly pipelinePublisher: DocumentPipelinePublisher,
   ) {}
 
   /**
@@ -56,12 +55,14 @@ export class DocumentService {
    * 若 Postgres 写入失败，回滚删除已写入的 Mongo 正文，避免脏数据
    */
   async create(dto: CreateDocumentDto) {
+    // 生成雪花 ID 作为文档 ID
     const id = nextSnowflakeId();
+    // 计算字数
     const wordCount = this.countWords(dto.content);
+    // 未传 status 时，默认草稿
     const status = dto.status ?? DocumentStatus.Draft;
     // 未传 summary 时，从正文截取预览作为 contentSummary
-    const contentSummary =
-      dto.summary ?? this.buildContentSummary(dto.content);
+    const contentSummary = dto.summary ?? this.buildContentSummary(dto.content);
 
     // 先写 Mongo，_id 由驱动自动生成 ObjectId
     const contentDoc = await this.contentModel.create({
@@ -72,7 +73,7 @@ export class DocumentService {
       version: 1,
       deleted: false,
     });
-    // ObjectId 转字符串，存入 Postgres content_id
+    // ObjectId 转字符串，存入 Postgres content_id「pg 和 mongDB 之间通过contentId关联」
     const contentId = String(contentDoc._id);
 
     try {
@@ -260,6 +261,62 @@ export class DocumentService {
   }
 
   /**
+   * 直接发布文档（不做审核）
+   *
+   * 流程：
+   * 1. 校验文档存在且状态为草稿 / 已发布
+   * 2. 写库：status=Published，刷新 publishTime
+   * 3. 读 Mongo 正文，投递 RabbitMQ（RAG 向量化）
+   * 4. 投递失败只打日志，不回滚「已发布」状态
+   *
+   * 异步消费侧见 DocumentPipelineConsumer → PipelineOrchestrator：
+   * 分块(ChunkingService) → 嵌入 → ES(kh_chunk)
+   */
+  async publish(id: string) {
+    this.logger.log(`发布文档：documentId=${id}`);
+    // 从 Postgres 获取文档
+    const doc = await this.em.findOne(DocumentEntity, {
+      where: { id, deleted: false },
+    });
+    if (!doc) {
+      throw new NotFoundException(`Document ${id} not found`);
+    }
+
+    // 仅草稿 / 已发布可发布（已发布再次发布会重建索引）
+    if (
+      doc.status !== DocumentStatus.Draft &&
+      doc.status !== DocumentStatus.Published
+    ) {
+      throw new BadRequestException('当前文档状态不允许发布');
+    }
+
+    doc.status = DocumentStatus.Published;
+    doc.publishTime = new Date();
+    // 更改状态，然后存到 Postgres
+    const saved = await this.em.save(doc);
+    // 取出 MongoDB 正文，加.lean() 性能优化，直接返回纯 js 对象，读取速度快，省内存，这里只需要content，所以加.lean()正合适
+    const contentDoc = await this.contentModel
+      .findOne({ _id: doc.contentId, deleted: false })
+      .lean();
+    // 获取 markdown 正文
+    const content = contentDoc?.content ?? null;
+
+    // MQ 失败不影响发布成功
+    try {
+      // 这里的 await 只是等待把消息发送到 MQ 的队列中，只有毫秒级
+      await this.pipelinePublisher.afterPublish(saved);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      this.logger.warn(
+        `发布后管线投递失败（不影响发布）：documentId=${id}, error=${message}`,
+      );
+    }
+
+    this.logger.log(`文档发布成功：documentId=${id}`);
+    return { ...saved, content: content ?? '' };
+  }
+
+  /**
    * 软删除文档
    * Postgres、Mongo 两侧都将 deleted 置为 true（不物理删正文）
    */
@@ -312,7 +369,9 @@ export class DocumentService {
     } catch (error) {
       if (error instanceof BadRequestException) throw error;
       const message = error instanceof Error ? error.message : String(error);
-      this.logger.error(`文件解析失败：name=${originalFilename}, error=${message}`);
+      this.logger.error(
+        `文件解析失败：name=${originalFilename}, error=${message}`,
+      );
       throw new BadRequestException(`文件解析失败: ${message}`);
     }
 
@@ -372,6 +431,7 @@ export class DocumentService {
    * 压缩连续空白后截断到 maxLen，超出则追加省略号
    */
   private buildContentSummary(content: string, maxLen = 200): string {
+    // TODO: 可以用模型生成摘要
     const trimmed = content.trim().replace(/\s+/g, ' ');
     return trimmed.length <= maxLen
       ? trimmed

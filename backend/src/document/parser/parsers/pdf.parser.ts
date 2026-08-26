@@ -44,18 +44,43 @@ export async function parsePdf(
   options: ParsePdfOptions = {},
 ): Promise<string> {
   const parser = new PDFParse({ data: buffer });
+  // 图片阈值：宽或高小于该像素数的图片将被过滤
   const threshold = options.imageThreshold ?? 50;
 
   try {
     // ---------- 1. 文本：按页取出 ----------
-    const textResult = await parser.getText();
-    const pageTexts = textResult?.pages ?? [];
+    // 返回 { pages: Page[], numPages: number, text: string, version: string, info: { ... } }
+    const textResult = await parser.getText(); // 按页的文本数组
+    const pageTexts = textResult?.pages ?? []; // 取出页数组
     /** pageNumber → 该页已上传图片的 URL 列表（保持提取顺序） */
-    const pageImageUrls = new Map<number, string[]>();
+    const pageImageUrls = new Map<number, string[]>(); // 页码和该页图片的映射，后面组装来
 
     // ---------- 2. 图片（可选）：提取 → 过滤小图 → 上传 ----------
     if (options.uploadImage) {
       try {
+        // imageResult 结构与 textResult 类似，但 pages 的 images 字段为 Image[]
+        // ImageResult
+        // {
+        //   pages: [                 // 数组：每个元素代表 PDF 的一页
+        //     {
+        //       pageNumber: 1,       // 页码（从 1 开始）
+        //       images: [            // 该页的所有图片
+        //         {
+        //           data: Uint8Array,   // 原始图片字节（如 PNG/JPEG）
+        //           dataUrl: "",        // base64 字符串（本项目传了 imageDataUrl:false，所以是空的）
+        //           name: "img_0",      // 图片资源名
+        //           width: 640,         // 宽（像素）
+        //           height: 480,        // 高（像素）
+        //           kind: 2,            // 像素格式枚举：1=灰度, 2=RGB, 3=RGBA
+        //         },
+        //         // ...该页更多图片
+        //       ]
+        //     },
+        //     { pageNumber: 2, images: [...] },
+        //     // ...更多页
+        //   ],
+        //   total: 5,               // 提取到的图片总数
+        // }
         const imageResult = await parser.getImage({
           imageThreshold: threshold,
           // 只要原始字节，不要 data URL，便于直接上传
@@ -63,9 +88,11 @@ export async function parsePdf(
           imageDataUrl: false,
         });
 
+        // 遍历每一页
         for (const page of imageResult?.pages ?? []) {
           const urls: string[] = [];
           let imgIdx = 0;
+          // 遍历该页的每张图片
           for (const image of page.images ?? []) {
             // 二次过滤：pdf-parse 已按阈值筛过，这里再挡一遍异常尺寸
             if (
@@ -182,7 +209,12 @@ export async function parsePdf(
  */
 function sniffImageContentType(data: Uint8Array): string {
   // JPEG: FF D8 FF
-  if (data.length >= 3 && data[0] === 0xff && data[1] === 0xd8 && data[2] === 0xff) {
+  if (
+    data.length >= 3 &&
+    data[0] === 0xff &&
+    data[1] === 0xd8 &&
+    data[2] === 0xff
+  ) {
     return 'image/jpeg';
   }
   // PNG: 89 50 4E 47（即 \x89PNG）
