@@ -7,6 +7,7 @@ import {
 import { ChunkingService } from './chunking.service';
 import { EmbeddingService } from './embedding.service';
 import { PipelineOrchestrator } from './pipeline.orchestrator';
+import { SearchIndexService } from './search-index.service';
 import { VectorIndexService } from './vector-index.service';
 
 @Module({
@@ -19,6 +20,7 @@ import { VectorIndexService } from './vector-index.service';
     ChunkingService,
     EmbeddingService,
     VectorIndexService,
+    SearchIndexService,
     PipelineOrchestrator,
   ],
   exports: [PipelineOrchestrator, VectorIndexService],
