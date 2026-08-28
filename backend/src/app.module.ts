@@ -6,12 +6,17 @@ import { AppController } from './app.controller';
 import { AppService } from './app.service';
 import { DocumentModule } from './document/document.module';
 import { DocumentEntity } from './document/entities/document.entity';
-import { StorageModule } from './storage/storage.module';
+import { DocumentReviewEntity } from './document/entities/document-review.entity';
 import { MqModule } from './mq/mq.module';
+import { PipelineModule } from './pipeline/pipeline.module';
+import { StorageModule } from './storage/storage.module';
 
 @Module({
   imports: [
     ConfigModule.forRoot({ isGlobal: true }),
+    PipelineModule,
+    MqModule,
+    StorageModule,
     TypeOrmModule.forRootAsync({
       inject: [ConfigService],
       useFactory: (config: ConfigService) => ({
@@ -21,7 +26,7 @@ import { MqModule } from './mq/mq.module';
         username: config.get<string>('POSTGRES_USER', 'user'),
         password: config.get<string>('POSTGRES_PASSWORD', '123456'),
         database: config.get<string>('POSTGRES_DB', 'knowledge_hub'),
-        entities: [DocumentEntity],
+        entities: [DocumentEntity, DocumentReviewEntity],
         synchronize: false,
       }),
     }),
@@ -35,8 +40,6 @@ import { MqModule } from './mq/mq.module';
       }),
     }),
     DocumentModule,
-    StorageModule,
-    MqModule,
   ],
   controllers: [AppController],
   providers: [AppService],
