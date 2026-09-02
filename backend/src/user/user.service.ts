@@ -15,6 +15,7 @@ import { DocumentEntity } from '../document/entities/document.entity';
 import { UserEntity } from './entities/user.entity';
 import { RoleEntity } from './entities/role.entity';
 import { UserRoleEntity } from './entities/user-role.entity';
+import { PermissionService } from './permission.service';
 import { QueryUserDto } from './dto/query-user.dto';
 import { CreateUserDto } from './dto/create-user.dto';
 import { UpdateUserDto } from './dto/update-user.dto';
@@ -32,14 +33,13 @@ export class UserService {
     private readonly userRoleRepo: Repository<UserRoleEntity>,
     @InjectRepository(DocumentEntity)
     private readonly documentRepo: Repository<DocumentEntity>,
+    private readonly permissionService: PermissionService,
   ) {}
 
-  // 在用户表中查找邮箱
   async findByEmail(email: string): Promise<UserEntity | null> {
     return this.userRepo.findOne({ where: { email, deleted: false } });
   }
 
-  // 在用户表中查找用户名
   async findByUsername(username: string): Promise<UserEntity | null> {
     return this.userRepo.findOne({
       where: { username, deleted: false },
@@ -83,7 +83,11 @@ export class UserService {
     };
   }
 
-  toAuthUser(user: UserEntity, roles: string[]): AuthUser {
+  toAuthUser(
+    user: UserEntity,
+    roles: string[],
+    permissions: string[],
+  ): AuthUser {
     return {
       userId: user.id,
       username: user.username,
@@ -91,6 +95,7 @@ export class UserService {
       email: user.email,
       avatar: user.avatar,
       roles,
+      permissions,
     };
   }
 
@@ -100,7 +105,9 @@ export class UserService {
       throw new UnauthorizedException('账户已禁用');
     }
     const roles = await this.getRoleCodes(userId);
-    return this.toAuthUser(user, roles);
+    const permissions =
+      await this.permissionService.getUserPermissionCodes(userId);
+    return this.toAuthUser(user, roles, permissions);
   }
 
   async validateCredentials(
@@ -122,7 +129,10 @@ export class UserService {
       throw new UnauthorizedException('用户名或密码错误');
     }
     const roles = await this.getRoleCodes(user.id);
-    return this.toAuthUser(user, roles);
+    const permissions = await this.permissionService.getUserPermissionCodes(
+      user.id,
+    );
+    return this.toAuthUser(user, roles, permissions);
   }
 
   async register(input: {
@@ -135,12 +145,10 @@ export class UserService {
     userId: string;
     emailVerificationRequired?: boolean;
   }> {
-    // 判断用户表中是否有注册的用户名
     const exists = await this.findByUsername(input.username);
     if (exists) {
       throw new ConflictException('用户名已存在');
     }
-    // 判断该邮箱是否已注册
     if (input.email) {
       const emailUsed = await this.findByEmail(input.email);
       if (emailUsed) throw new ConflictException('邮箱已被使用');
@@ -154,11 +162,10 @@ export class UserService {
       password: await hash(input.password, 10),
       email: input.email ?? null,
       realName: input.realName ?? null,
-      status: needVerify ? 0 : 1, // 0 表示未激活，1 表示已激活
-      emailVerified: needVerify ? 0 : 1, // 0 表示未激活，1 表示已激活
+      status: needVerify ? 0 : 1,
+      emailVerified: needVerify ? 0 : 1,
     });
     await this.userRepo.save(user);
-    // 默认分配用户角色
     await this.assignRole(userId, RoleCode.USER);
 
     return {
@@ -277,7 +284,6 @@ export class UserService {
     return roleCodes;
   }
 
-  // 分配角色
   async assignRole(userId: string, roleCode: string): Promise<void> {
     const role = await this.roleRepo.findOne({ where: { roleCode } });
     if (!role) {
@@ -359,10 +365,8 @@ export class UserService {
   }
 
   async activateEmail(userId: string): Promise<string> {
-    // 获取用户信息
     const user = await this.findByIdOrThrow(userId);
     if (user.emailVerified === 1) return '账户已激活，请直接登录';
-    // 更新激活状态
     user.emailVerified = 1;
     user.status = 1;
     await this.userRepo.save(user);
